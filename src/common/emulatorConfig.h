@@ -111,7 +111,6 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
-	bool                   lod_stats_enabled           = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -191,7 +190,6 @@ uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
-bool LodStatsEnabled();
 // Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.
 bool AsyncPipelinesEnabled();
 bool TrophyEnabled();
