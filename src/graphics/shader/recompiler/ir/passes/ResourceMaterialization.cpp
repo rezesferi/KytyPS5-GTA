@@ -37,10 +37,30 @@ struct DescriptorValueHash {
 	}
 };
 
-// With stable layouts, variable-size flattened SRT regions (record blocks, image table mappings)
-// round up to this many words, so the offsets after them, which shaders take as constants, stay
-// the same when the game's tables change size a little.
+// With stable layouts, image table mappings round up to this many words, so the offsets after
+// them, which shaders take as constants, stay the same when the game resizes a table a little.
 constexpr size_t StableSrtWords = 4096u;
+// Record-table blocks of the current materialization (see MaterializeIndirectDescriptor()): mapping
+// words name them by their offset within the root's blocks until FlushRecordBlocks() appends them.
+struct RecordBlocks {
+	size_t                mapping_offset = 0;
+	size_t                entries        = 0;
+	std::vector<uint32_t> blocks;
+};
+thread_local std::vector<RecordBlocks> t_record_blocks;
+
+void FlushRecordBlocks(std::vector<uint32_t>& flattened_srt) {
+	for (auto& record: t_record_blocks) {
+		// A block's flattened SRT word; 0 (no block) never names one.
+		const auto base = static_cast<uint32_t>(flattened_srt.size());
+		for (size_t entry = 0; entry < record.entries; ++entry) {
+			flattened_srt[record.mapping_offset + 2u + entry * 2u] += base;
+		}
+		flattened_srt.insert(flattened_srt.end(), record.blocks.begin(), record.blocks.end());
+	}
+	t_record_blocks.clear();
+}
+
 // Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
 constexpr size_t MinIndirectMappingCapacity = 8u;
 // Elements of one table that a GPU-chosen record names (see MaterializeIndirectDescriptor()):
@@ -810,15 +830,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
 		                                         : MinIndirectMappingCapacity,
 		    std::bit_ceil(entries.size()));
-		// The blocks' size follows the candidate counts, which streaming changes, and later roots'
-		// flattened SRT offsets reach the shader as constants: a size rounded up to StableSrtWords
-		// keeps the program across small changes.
-		if (stable_layout) blocks.resize(Common::AlignUp(blocks.size(), StableSrtWords), 0u);
 		// A list's slot count and device address precede the mapping (see EmitImageHeapEntry()).
 		const auto list_offset    = snapshot.flattened_srt.size();
 		const auto mapping_offset = list_offset + (heap_list ? 3u : 0u);
-		const auto blocks_offset  = mapping_offset + 1u + key_capacity * 2u;
-		snapshot.flattened_srt.resize(blocks_offset + blocks.size(), 0u);
+		snapshot.flattened_srt.resize(mapping_offset + 1u + key_capacity * 2u, 0u);
 		if (heap_list) {
 			snapshot.flattened_srt[list_offset]      = heap_view.slot_count;
 			snapshot.flattened_srt[list_offset + 1u] = static_cast<uint32_t>(heap_view.slots);
@@ -827,12 +842,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(entries.size());
 		for (size_t entry = 0; entry < entries.size(); ++entry) {
 			snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = entries[entry].first;
-			// A block's flattened SRT word; 0 (no block) never names one.
-			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] =
-			    static_cast<uint32_t>(blocks_offset + entries[entry].second);
+			// The block's offset in the root's blocks until FlushRecordBlocks() adds where they land.
+			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = entries[entry].second;
 		}
-		std::ranges::copy(blocks, snapshot.flattened_srt.begin() + static_cast<std::ptrdiff_t>(blocks_offset));
-		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout && !heap_list) {
+		// The blocks follow the candidate counts, which streaming changes, while flattened SRT
+		// offsets reach the shader as constants: they go after every other region, so their size
+		// moves no constant (mapping entries name them by data).
+		t_record_blocks.push_back({mapping_offset, entries.size(), std::move(blocks)});
+		// Padded children keep the descriptor arrays the same size while candidate counts change.
+		if (((std::is_same_v<Specialization, ResourceSpecialization::Image> && !heap_list) ||
+		     std::is_same_v<Specialization, ResourceSpecialization::Sampler>) && stable_layout) {
 			const auto children = descriptors.size() - children_begin;
 			const auto total    = std::max<size_t>(
                 program.stage == ShaderType::Compute
@@ -2003,6 +2022,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	t_record_blocks.clear();
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -2219,6 +2239,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	FlushRecordBlocks(snapshot.flattened_srt);
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
