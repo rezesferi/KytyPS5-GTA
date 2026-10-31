@@ -24,6 +24,18 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+
+struct DescriptorValueHash {
+	size_t operator()(const DescriptorValue& value) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull ^ value.dword_count;
+		for (const auto dword: value.dwords) {
+			hash = (hash ^ dword) * 0x100000001b3ull;
+			hash ^= hash >> 29u;
+		}
+		return static_cast<size_t>(hash);
+	}
+};
+
 // Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
 constexpr size_t MinIndirectMappingCapacity = 8u;
 // See SetComputeIndirectFloors().
@@ -567,17 +579,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	// Ordinals of the distinct candidates: tables of tens of thousands of descriptors (the material
+	// tables of ray tracing hit groups) make a linear search quadratic.
+	std::unordered_map<DescriptorValue, uint32_t, DescriptorValueHash> ordinals;
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		const auto ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
+		const auto [found, inserted] = ordinals.try_emplace(
+		    candidate, static_cast<uint32_t>(descriptors.size() - children_begin + 1u));
+		if (inserted) {
 			descriptors.push_back(candidate);
 			auto child = root_resource;
 			child.indirect_root = resource_index;
 			specializations.push_back(child);
 		}
-		return ordinal;
+		return found->second;
 	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -662,7 +677,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		std::ranges::sort(records);
 		records.erase(std::unique(records.begin(), records.end()), records.end());
 		std::vector<std::pair<uint32_t, uint32_t>> entries; // V# first word, block offset.
-		std::vector<std::array<uint32_t, 4>> tables;           // the V# of each entry
+		std::unordered_set<DescriptorValue, DescriptorValueHash> tables; // the V# of each entry
 		std::vector<uint32_t> blocks;
 		for (const auto record: records) {
 			DescriptorValue record_table {.dword_count = 4u};
@@ -671,7 +686,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return read_failed("record table read", 0u, 0u, record, pointer.offset, 16u);
 			const std::array<uint32_t, 4> table_words {record_table.dwords[0], record_table.dwords[1],
 			                                           record_table.dwords[2], record_table.dwords[3]};
-			if (std::ranges::find(tables, table_words) != tables.end()) continue;
+			if (!tables.insert(record_table).second) continue;
 			ShaderBufferResource elements;
 			if (!DecodeBufferDescriptor(record_table, elements)) return false;
 			const uint64_t element_base = elements.Base48();
@@ -695,7 +710,6 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				blocks.push_back(intern_candidate(candidate));
 			}
 			entries.emplace_back(table_words[0], block);
-			tables.push_back(table_words);
 		}
 		// Every element null: the root's null descriptor serves every key.
 		if (descriptors.size() == children_begin) return true;
