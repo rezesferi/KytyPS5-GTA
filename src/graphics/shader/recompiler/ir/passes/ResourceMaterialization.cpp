@@ -680,6 +680,12 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		std::ranges::sort(records);
 		records.erase(std::unique(records.begin(), records.end()), records.end());
 		std::vector<std::pair<uint32_t, uint32_t>> entries; // V# first word, block offset.
+		struct KeyedTable {
+			uint64_t base  = 0;
+			uint64_t count = 0;
+			size_t   entry = 0;
+		};
+		std::unordered_map<uint32_t, KeyedTable> keyed_tables;
 		std::unordered_set<DescriptorValue, DescriptorValueHash> tables; // the V# of each entry
 		std::vector<uint32_t> blocks;
 		// Sampled roots keep their candidates in the host's resident image heap: the blocks hold
@@ -741,7 +747,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					blocks.push_back(intern_candidate(candidate));
 				}
 			}
-			entries.emplace_back(table_words[0], block);
+			// Tables at one base (a scene-wide table and a range of it) give the shader the same
+			// elements for the keys both cover: the longer one serves both.
+			const auto [same_key, inserted] =
+			    keyed_tables.try_emplace(table_words[0], KeyedTable {element_base, count, entries.size()});
+			if (inserted) {
+				entries.emplace_back(table_words[0], block);
+			} else if (same_key->second.base != element_base) {
+				return failed("record tables", "two record tables share the first word of their V#");
+			} else if (count > same_key->second.count) {
+				same_key->second.count                 = count;
+				entries[same_key->second.entry].second = block;
+			}
 		}
 		ImageHeapView heap_view;
 		if (heap_list) {
