@@ -485,6 +485,9 @@ private:
 	}
 
 	void AddOutput(Value value, uint32_t gate);
+	void FindFlatOnlyNodes(std::span<const Operand> conditions, std::span<const Operand> reads,
+	                       std::span<const std::vector<Operand>> descriptors,
+	                       std::span<const Operand> outputs);
 	void Consume(std::vector<std::vector<uint32_t>>& gates);
 	Ref Evaluate(Value value, uint32_t context);
 	Operand Analyze(uint32_t index);
@@ -498,7 +501,7 @@ private:
 	void Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Operand&));
 	void Store(const Node& node);
 	void EmitNode(uint32_t index);
-	void EmitRead(const Node& node);
+	void EmitRead(const Node& node, uint32_t index);
 	void EmitStrict(const Node& node);
 
 	ResourcePlan&                                     m_plan;
@@ -511,6 +514,8 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
+	// By node: the flattened SRT dword that is the only use of its value, else NoFlatSlot.
+	std::vector<uint32_t> m_flat_slots;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -568,6 +573,47 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 		AddOutput(fill.pattern_size, UINT32_MAX);
 		AddOutput(fill.element_count, UINT32_MAX);
 		for (const auto value: fill.values) AddOutput(value, UINT32_MAX);
+	}
+}
+
+// A load node whose value fills one flattened SRT dword and nothing else: no other node, no
+// control condition, descriptor word or output uses it, nor any EXEC mask a context tests.
+void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
+                                       std::span<const Operand> reads,
+                                       std::span<const std::vector<Operand>> descriptors,
+                                       std::span<const Operand> outputs) {
+	m_flat_slots.assign(m_nodes.size(), NoFlatSlot);
+	std::vector<bool> used(m_nodes.size(), false);
+	const auto use = [&](const Operand& operand) {
+		if (operand.kind == Kind::Node && operand.value < used.size()) used[operand.value] = true;
+	};
+	for (const auto& node: m_nodes) {
+		for (const auto& arg: node.args) use(arg);
+	}
+	for (const auto& operand: conditions) use(operand);
+	for (const auto& words: descriptors) {
+		for (const auto& operand: words) use(operand);
+	}
+	for (const auto& operand: outputs) use(operand);
+	std::unordered_set<const Inst*> masks;
+	for (const auto& mask: m_masks) {
+		if (const auto* inst = mask.Resolve().TryInstruction()) masks.insert(inst);
+	}
+	for (uint32_t slot = 0; slot < reads.size(); ++slot) {
+		const auto& operand = reads[slot];
+		if (operand.kind != Kind::Node || operand.value >= m_nodes.size()) continue;
+		const auto index = static_cast<size_t>(operand.value);
+		if (m_flat_slots[index] != NoFlatSlot) used[index] = true; // Two dwords.
+		m_flat_slots[index] = m_plan.srt_reads[slot].flat_offset;
+	}
+	for (size_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		const auto  op   = node.inst->GetOpcode();
+		if (used[index] || node.referenced || masks.contains(node.inst) ||
+		    (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
+		     op != ValueOpcode::LoadBufferU32)) {
+			m_flat_slots[index] = NoFlatSlot;
+		}
 	}
 }
 
@@ -888,7 +934,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 		}
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32: EmitRead(node); return;
+		case ValueOpcode::LoadBufferU32: EmitRead(node, index); return;
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: {
@@ -967,7 +1013,7 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 }
 
 // Raw scalar and uniform DWORD buffer loads; out-of-bounds reads are zero.
-void WalkerCompiler::EmitRead(const Node& node) {
+void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 	auto&      c    = m_code;
 	const auto& inst = *node.inst;
 	const auto op = inst.GetOpcode();
@@ -1035,6 +1081,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.mov(c.dword[c.r8 + 8], c.eax);
+		c.mov(c.dword[c.r8 + 12], index < m_flat_slots.size() ? m_flat_slots[index] : NoFlatSlot);
 		c.add(c.r8, 16);
 		Store(node);
 	}
@@ -1280,6 +1327,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	FindFlatOnlyNodes(conditions, reads, descriptors, outputs);
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
@@ -1456,7 +1504,8 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		for (auto* read = first; read != end; read += 2) {
 			// Nothing is mapped below guest memory: those bytes read zero on every thread.
 			if (read[0] >= GuestMemoryStart)
-				runtime.record_load(runtime.userdata, read[0], static_cast<uint32_t>(read[1]));
+				runtime.record_load(runtime.userdata, read[0], static_cast<uint32_t>(read[1]),
+				                    static_cast<uint32_t>(read[1] >> 32u));
 		}
 	}
 	return true;

@@ -42,21 +42,29 @@ public:
 	void Clear() {
 		m_entries.clear();
 		m_bytes.clear();
+		m_flat_loads.clear();
+		m_stage       = 0;
 		m_failed      = false;
 		m_gpu_written = false;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	// A plain load the SRT walker made.
-	void               RecordLoad(uint64_t address, uint32_t value);
+	// A plain load the SRT walker made for the stage being resolved; flat_slot names the
+	// flattened SRT dword that is its only use (NoFlatSlot otherwise).
+	void               RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot);
+	void               SetStage(uint32_t stage) { m_stage = stage; }
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Whether some read may have taken stale bytes of memory the GPU wrote (the backing store
 	// gets them only once read back).
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
-	// Execution thread: whether every read still gives the recorded bytes.
+	// Execution thread: whether every read still gives the recorded bytes. The loads that only
+	// fill flattened SRT dwords are not compared: RefreshFlatLoads() reads them again.
 	[[nodiscard]] bool StillValid() const;
+	// Execution thread: writes the current value of each such load into its stage's flattened
+	// SRT (the guest rewrites constants, such as a camera matrix, after it submits the draws).
+	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources) const;
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -66,11 +74,20 @@ private:
 		uint32_t offset  = 0;
 		bool     strict  = false;
 	};
-	void                 Append(uint64_t address, const void* data, uint32_t size, bool strict);
-	std::vector<Entry>   m_entries;
-	std::vector<uint8_t> m_bytes;
-	bool                 m_failed      = false;
-	bool                 m_gpu_written = false;
+	// Consecutive dwords of one page that fill consecutive flattened SRT dwords of a stage.
+	struct FlatLoad {
+		uint64_t address = 0;
+		uint32_t stage   = 0;
+		uint32_t slot    = 0;
+		uint32_t count   = 1;
+	};
+	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict);
+	std::vector<Entry>    m_entries;
+	std::vector<uint8_t>  m_bytes;
+	std::vector<FlatLoad> m_flat_loads;
+	uint32_t              m_stage       = 0;
+	bool                  m_failed      = false;
+	bool                  m_gpu_written = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
@@ -86,6 +103,14 @@ struct ProgramResolution {
 	void Reset() {
 		reads.Clear();
 		stages = 0;
+	}
+	// Execution thread: whether the resolution holds, with its flattened SRT dwords read again.
+	[[nodiscard]] bool Revalidate() {
+		if (!reads.StillValid()) {
+			return false;
+		}
+		reads.RefreshFlatLoads(std::span(resources).first(stages));
+		return true;
 	}
 };
 

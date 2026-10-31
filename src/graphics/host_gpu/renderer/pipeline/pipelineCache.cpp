@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -130,8 +131,8 @@ bool ReadAheadShaderState(void* userdata, uint64_t address, void* data, uint64_t
 	return static_cast<GuestReadLog*>(userdata)->Read(address, data, size, false);
 }
 
-void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value) {
-	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value);
+void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t flat_slot) {
+	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
 }
 
 class ProgramLockGuard {
@@ -332,8 +333,59 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 	return true;
 }
 
-void GuestReadLog::RecordLoad(uint64_t address, uint32_t value) {
+void GuestReadLog::RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot) {
+	if (flat_slot != ShaderRecompiler::IR::NoFlatSlot) {
+		if (!m_flat_loads.empty()) {
+			auto& last = m_flat_loads.back();
+			const auto next = last.address + uint64_t {last.count} * sizeof(uint32_t);
+			if (last.stage == m_stage && next == address && last.slot + last.count == flat_slot &&
+			    (address & 0xfffu) != 0) {
+				last.count++;
+				return;
+			}
+		}
+		m_flat_loads.push_back({address, m_stage, flat_slot, 1});
+		return;
+	}
 	Append(address, &value, sizeof(value), false);
+}
+
+void GuestReadLog::RefreshFlatLoads(
+    std::span<ShaderRecompiler::IR::ResourceSnapshot> resources) const {
+	// As the execution thread's own walk loads: around the GPU's writes on the pages it owns,
+	// directly elsewhere.
+	// The loads of a draw alternate between a few pages: decide each once (see StillValid()).
+	struct CheckedPage {
+		uint64_t       page    = UINT64_MAX;
+		bool           owned   = false;
+		const uint8_t* backing = nullptr;
+	};
+	std::array<CheckedPage, 4> checked {};
+	for (const auto& load: m_flat_loads) {
+		if (load.stage >= resources.size() ||
+		    uint64_t {load.slot} + load.count > resources[load.stage].flattened_srt.size()) {
+			continue;
+		}
+		const auto page_index = load.address >> 12u;
+		auto&      page       = checked[page_index % checked.size()];
+		if (page.page != page_index) {
+			page.page    = page_index;
+			page.owned   = Libs::LibKernel::Memory::MayFaultOnGpuRead(load.address & ~0xfffull, 4096);
+			page.backing = page.owned ? Libs::LibKernel::Memory::FindAroundBackingPage(load.address)
+			                          : nullptr;
+		}
+		auto*      values = resources[load.stage].flattened_srt.data() + load.slot;
+		const auto bytes  = load.count * sizeof(uint32_t);
+		const bool around =
+		    page.owned &&
+		    (page.backing != nullptr ? Libs::LibKernel::Memory::TryReadAroundGpuWritesOnPage(
+		                                   load.address, values, bytes, page.backing)
+		                             : Libs::LibKernel::Memory::TryReadAroundGpuWrites(
+		                                   load.address, values, bytes));
+		if (!around) {
+			std::memcpy(values, reinterpret_cast<const void*>(load.address), bytes);
+		}
+	}
 }
 
 // Most logged reads are a few dwords: compare those without a call.
@@ -1227,6 +1279,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const auto stage_index    = ahead.stages++;
 	auto&      resources      = ahead.resources[stage_index];
 	auto&      specialization = ahead.specializations[stage_index];
+	ahead.reads.SetStage(stage_index);
 	// The walker's loads of GPU-owned pages read the backing store instead of downloading
 	// GPU-written bytes, and the loads that still fault fail the walk; every load is logged with
 	// the value it read, for the execution thread to check.
