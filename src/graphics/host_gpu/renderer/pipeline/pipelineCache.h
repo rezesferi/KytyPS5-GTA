@@ -416,6 +416,10 @@ private:
 	// Pipelines created since the driver cache was last written; a background thread writes
 	// the cache periodically so a crash does not lose the pipelines compiled until then.
 	std::atomic_uint64_t          m_unsaved_pipelines {0};
+	// A pipeline whose creation took long: the driver cache is written at once rather than at the
+	// next period, so closing the emulator does not lose minutes of driver compilation.
+	std::atomic_bool              m_save_soon {false};
+	void                          NoteCreatedPipeline(std::chrono::steady_clock::time_point started);
 	Common::Mutex                 m_write_mutex;
 	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;

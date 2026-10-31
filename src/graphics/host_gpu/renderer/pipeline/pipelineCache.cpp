@@ -1026,7 +1026,7 @@ void PipelineCache::InitializeDriverCache() {
 		auto           next   = std::chrono::steady_clock::now() + Period;
 		while (!stop.stop_requested()) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(250));
-			if (std::chrono::steady_clock::now() < next) {
+			if (std::chrono::steady_clock::now() < next && !m_save_soon.exchange(false)) {
 				continue;
 			}
 			next = std::chrono::steady_clock::now() + Period;
@@ -1035,6 +1035,14 @@ void PipelineCache::InitializeDriverCache() {
 			}
 		}
 	});
+}
+
+void PipelineCache::NoteCreatedPipeline(std::chrono::steady_clock::time_point started) {
+	constexpr auto LongCreation = std::chrono::seconds(5);
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+	if (std::chrono::steady_clock::now() - started >= LongCreation) {
+		m_save_soon.store(true, std::memory_order_relaxed);
+	}
 }
 
 void PipelineCache::Save() {
@@ -1716,7 +1724,8 @@ void PipelineCache::AsyncPipelineWorker() {
 			job = m_async_jobs.front();
 			m_async_jobs.pop_front();
 		}
-		Pipeline pipeline;
+		Pipeline   pipeline;
+		const auto started = std::chrono::steady_clock::now();
 		if (job.compute) {
 			CreatePipelineInternal(m_graphics, pipeline, *job.module, m_driver_cache);
 		} else {
@@ -1724,7 +1733,7 @@ void PipelineCache::AsyncPipelineWorker() {
 		}
 		const bool created = pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 		if (created) {
-			m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+			NoteCreatedPipeline(started);
 		}
 		std::lock_guard lock(m_async_mutex);
 		if (job.compute) {
@@ -2086,6 +2095,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		     ps_active ? static_cast<void*>(stages[3]->module) : nullptr);
 	}
 
+	const auto started = std::chrono::steady_clock::now();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -2093,7 +2103,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
-	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+	NoteCreatedPipeline(started);
 	m_last_graphics_key      = key;
 	m_last_graphics_pipeline = &pipeline;
 
@@ -2137,13 +2147,14 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
+	const auto started = std::chrono::steady_clock::now();
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
-	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+	NoteCreatedPipeline(started);
 
 	return pipeline;
 }
