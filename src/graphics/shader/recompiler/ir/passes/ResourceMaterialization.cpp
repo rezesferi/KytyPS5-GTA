@@ -235,6 +235,13 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
 }
 
+// The first and the last word of a table are in guest memory.
+bool TableInGuestMemory(uint64_t base, uint64_t size, const SrtRuntime& runtime) {
+	std::array<uint32_t, 1> word {};
+	return base != 0u && size >= 4u && ReadScalarTable(base, size, 0u, runtime, word) &&
+	       ReadScalarTable(base, size, size - 4u, runtime, word);
+}
+
 bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
@@ -717,6 +724,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    : element_size >= pointer.element_offset + descriptor_bytes
 			        ? (element_size - pointer.element_offset - descriptor_bytes) / pointer.element_stride + 1u
 			        : 0u;
+			// Rows of scene-wide pointer tables can name records that hold no table any more (the GPU
+			// never selects them): a table outside guest memory gives the shader no elements, and its
+			// key reads the null descriptor like any other key without a table.
+			if (count != 0u && !TableInGuestMemory(element_base, element_size, runtime)) continue;
 			if (count > MaxRecordTableElements)
 				return failed("record table elements", fmt::format("record={:#x} count={}", record, count));
 			const auto block = static_cast<uint32_t>(blocks.size());
