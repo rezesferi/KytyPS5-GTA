@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -36,6 +37,10 @@ struct DescriptorValueHash {
 	}
 };
 
+// With stable layouts, variable-size flattened SRT regions (record blocks, image table mappings)
+// round up to this many words, so the offsets after them, which shaders take as constants, stay
+// the same when the game's tables change size a little.
+constexpr size_t StableSrtWords = 4096u;
 // Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
 constexpr size_t MinIndirectMappingCapacity = 8u;
 // Elements of one table that a GPU-chosen record names (see MaterializeIndirectDescriptor()):
@@ -805,6 +810,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
 		                                         : MinIndirectMappingCapacity,
 		    std::bit_ceil(entries.size()));
+		// The blocks' size follows the candidate counts, which streaming changes, and later roots'
+		// flattened SRT offsets reach the shader as constants: a size rounded up to StableSrtWords
+		// keeps the program across small changes.
+		if (stable_layout) blocks.resize(Common::AlignUp(blocks.size(), StableSrtWords), 0u);
 		// A list's slot count and device address precede the mapping (see EmitImageHeapEntry()).
 		const auto list_offset    = snapshot.flattened_srt.size();
 		const auto mapping_offset = list_offset + (heap_list ? 3u : 0u);
@@ -1238,6 +1247,13 @@ bool MaterializeImageTable(const ResourcePlan& program,
 		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
 		const auto& mapping = snapshot.image_tables.back().mapping;
 		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), mapping.begin(), mapping.end());
+		// The mapping follows the table's size, and later flattened SRT offsets reach the shader
+		// as constants: a size rounded up to StableSrtWords keeps the program when the game
+		// resizes the table a little.
+		if (g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
+			snapshot.flattened_srt.resize(
+			    mapping_offsets.back() + Common::AlignUp(mapping.size(), StableSrtWords), 0u);
+		}
 		found = snapshot.image_tables.end() - 1;
 	}
 	const auto table_index     = static_cast<uint32_t>(found - snapshot.image_tables.begin());
