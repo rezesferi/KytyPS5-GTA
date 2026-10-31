@@ -12,8 +12,8 @@ namespace Libs::Graphics {
 
 class RangeSet final {
 public:
-	void Add(uint64_t address, uint64_t size) {
-		m_version++;
+	// Both return whether the set changed.
+	bool Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -23,23 +23,28 @@ public:
 			it = m_ranges.emplace_hint(it, address, end);
 		} else {
 			if (it->second >= end) {
-				return;
+				return false;
 			}
 			it->second = end;
 		}
+		m_version++;
 		auto next = std::next(it);
 		while (next != m_ranges.end() && next->first <= it->second) {
 			it->second = std::max(it->second, next->second);
 			next       = m_ranges.erase(next);
 		}
+		return true;
 	}
 
-	void Subtract(uint64_t address, uint64_t size) {
-		m_version++;
+	bool Subtract(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			it = std::prev(it);
+		}
+		const bool changed = it != m_ranges.end() && it->first < end;
+		if (changed) {
+			m_version++;
 		}
 		while (it != m_ranges.end() && it->first < end) {
 			const auto begin = it->first;
@@ -53,6 +58,7 @@ public:
 				break;
 			}
 		}
+		return changed;
 	}
 
 	void Clear() {

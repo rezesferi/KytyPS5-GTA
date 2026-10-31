@@ -181,7 +181,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    if (m_gpu_modified_ranges.Subtract(address, bytes)) {
+			    NoteGpuModifiedChange(address, bytes);
+		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -736,7 +738,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (is_written) {
 		m_gpu_write_generation++;
-		m_gpu_modified_ranges.Add(vaddr, size);
+		if (m_gpu_modified_ranges.Add(vaddr, size)) {
+			NoteGpuModifiedChange(vaddr, size);
+		}
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteWrite(vaddr, size);
 	}
@@ -1083,7 +1087,9 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 			start += chunk;
 		}
 	});
-	m_gpu_modified_ranges.Subtract(vaddr, size);
+	if (m_gpu_modified_ranges.Subtract(vaddr, size)) {
+		NoteGpuModifiedChange(vaddr, size);
+	}
 	return true;
 }
 
@@ -1362,21 +1368,50 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	// Reads around the GPU's writes ask this for every few bytes they read, mostly within the
-	// same gap between GPU-written ranges: answer those from the last gap found until the set
-	// changes.
-	auto& gap = m_clean_gap;
-	if (gap.version == m_gpu_modified_ranges.Version() && vaddr >= gap.begin &&
-	    vaddr < gap.end && size <= gap.end - vaddr) {
-		return false;
+	// Reads around the GPU's writes ask this for every few bytes they read, on a few pages that
+	// mix the guest's descriptors with GPU-written data: answer within a page from its mask.
+	constexpr uint64_t PageSize = 4096;
+	const auto         page     = vaddr / PageSize;
+	if (size == 0 || (vaddr + size - 1) / PageSize != page) {
+		return m_gpu_modified_ranges.Intersects(vaddr, size);
 	}
-	uint64_t begin = 0;
-	uint64_t end   = 0;
-	if (m_gpu_modified_ranges.Intersects(vaddr, size, begin, end)) {
-		return true;
+	auto& mask = m_dirty_masks[page % m_dirty_masks.size()];
+	if (mask.page != page) {
+		mask.page = page;
+		mask.bits.fill(0);
+		const auto base = page * PageSize;
+		m_gpu_modified_ranges.ForEachInRange(base, PageSize, [&](uint64_t start, uint64_t end) {
+			const auto low  = std::max(start, base) - base;
+			const auto high = std::min(end, base + PageSize) - base - 1;
+			for (auto word = low / 64; word <= high / 64; word++) {
+				const auto from = word == low / 64 ? low % 64 : 0;
+				const auto to   = word == high / 64 ? high % 64 : 63;
+				mask.bits[word] |= (~uint64_t {0} >> (63 - to)) & (~uint64_t {0} << from);
+			}
+		});
 	}
-	gap = {.version = m_gpu_modified_ranges.Version(), .begin = begin, .end = end};
+	const auto first = vaddr % PageSize;
+	const auto last  = first + size - 1;
+	for (auto word = first / 64; word <= last / 64; word++) {
+		const auto low  = word == first / 64 ? first % 64 : 0;
+		const auto high = word == last / 64 ? last % 64 : 63;
+		const auto bits = (~uint64_t {0} >> (63 - high)) & (~uint64_t {0} << low);
+		if ((mask.bits[word] & bits) != 0) {
+			return true;
+		}
+	}
 	return false;
+}
+
+void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t PageSize = 4096;
+	const auto         first    = vaddr / PageSize;
+	const auto         last     = (vaddr + std::max<uint64_t>(size, 1) - 1) / PageSize;
+	for (auto& mask: m_dirty_masks) {
+		if (mask.page >= first && mask.page <= last) {
+			mask.page = UINT64_MAX;
+		}
+	}
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -1526,7 +1561,9 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			    const auto first = std::max(page, start);
 			    const auto last  = std::min(page + bytes, finish);
-			    m_gpu_modified_ranges.Add(first, last - first);
+			    if (m_gpu_modified_ranges.Add(first, last - first)) {
+				    NoteGpuModifiedChange(first, last - first);
+			    }
 		    });
 	}
 }
