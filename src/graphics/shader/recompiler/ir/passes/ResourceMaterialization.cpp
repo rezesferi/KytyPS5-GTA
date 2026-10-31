@@ -38,6 +38,9 @@ struct DescriptorValueHash {
 
 // Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
 constexpr size_t MinIndirectMappingCapacity = 8u;
+// Elements of one table that a GPU-chosen record names (see MaterializeIndirectDescriptor()):
+// scene-wide tables hold hundreds of thousands of them.
+constexpr uint64_t MaxRecordTableElements = uint64_t {1} << 21u;
 // See SetComputeIndirectFloors().
 std::atomic<size_t> g_compute_indirect_keys {MinIndirectMappingCapacity};
 std::atomic<size_t> g_compute_indirect_images {1u};
@@ -689,6 +692,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			            image.resource_class == ImageResourceClass::Sampled &&
 			            image.mip_mode != ImageMipMode::Dynamic;
 		}
+		std::vector<uint32_t>        element_words;
 		std::vector<DescriptorValue> heap_values;
 		std::vector<size_t>          heap_blocks; // The block word of each heap value.
 		for (const auto record: records) {
@@ -707,14 +711,24 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    : element_size >= pointer.element_offset + descriptor_bytes
 			        ? (element_size - pointer.element_offset - descriptor_bytes) / pointer.element_stride + 1u
 			        : 0u;
-			if (count > MaxIndirectDescriptorProbes)
+			if (count > MaxRecordTableElements)
 				return failed("record table elements", fmt::format("record={:#x} count={}", record, count));
 			const auto block = static_cast<uint32_t>(blocks.size());
 			blocks.push_back(static_cast<uint32_t>(count));
+			// One read of the whole table: large ones (a scene-wide sampler table of 720 thousand
+			// entries) would otherwise take one capture entry per element.
+			if (element_base != 0u && count > 1u) {
+				element_words.resize((element_size + 3u) / 4u);
+				if (!ReadScalarTable(element_base, element_size, 0u, runtime, element_words))
+					return read_failed("record table read", 0u, 0u, element_base, 0u, element_size);
+			}
 			for (uint32_t element = 0; element < count; ++element) {
 				const auto offset = pointer.element_offset + uint64_t {element} * pointer.element_stride;
 				DescriptorValue candidate {.dword_count = dword_count};
-				if (element_base != 0u && offset + descriptor_bytes <= element_size &&
+				if (element_base != 0u && offset + descriptor_bytes <= element_size && count > 1u) {
+					std::copy_n(element_words.begin() + static_cast<std::ptrdiff_t>(offset / 4u),
+					            read_dwords, candidate.dwords.begin());
+				} else if (element_base != 0u && offset + descriptor_bytes <= element_size &&
 				    !ReadScalarTable(element_base, element_size, offset, runtime,
 				                     std::span(candidate.dwords).first(read_dwords)))
 					return read_failed("record descriptor read", 0u, element, element_base, offset, descriptor_bytes);
