@@ -13,6 +13,21 @@ using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uin
 using SrtLoadRecorder = void (*)(void* userdata, uint64_t address, uint32_t value,
                                  uint32_t flat_slot);
 inline constexpr uint32_t NoFlatSlot = UINT32_MAX;
+// A load whose value is only one descriptor word with bits the execution thread may refresh
+// (DescriptorRefreshMask()) reports DescriptorSlot(source, word) instead of a flat slot.
+inline constexpr uint32_t DescriptorSlotFlag = 0x80000000u;
+constexpr uint32_t DescriptorSlot(uint32_t source, uint32_t word) {
+	return DescriptorSlotFlag | (source << 3u) | word;
+}
+constexpr bool IsDescriptorSlot(uint32_t slot) {
+	return slot != NoFlatSlot && (slot & DescriptorSlotFlag) != 0;
+}
+constexpr uint32_t DescriptorSlotSource(uint32_t slot) {
+	return (slot & ~DescriptorSlotFlag) >> 3u;
+}
+constexpr uint32_t DescriptorSlotWord(uint32_t slot) {
+	return slot & 7u;
+}
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of

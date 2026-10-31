@@ -451,11 +451,73 @@ void TestAheadWalkNamesFlatOnlyLoads() {
   Check(WalkSrt(plan, runtime, flat, nullptr) &&
             flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x41000u} && loads.size() == 3,
         "ahead walk did not report its three loads");
+  // The buffer's base word also fills a flattened dword: it is a refreshable descriptor word.
   for (const auto &load : loads) {
-    const auto expected = load.address == 0x41000u ? 0u : NoFlatSlot;
+    const auto expected = load.address == 0x41000u   ? 0u
+                          : load.address == 0x42000u ? DescriptorSlot(1, 0)
+                                                     : NoFlatSlot;
     Check(load.flat_slot == expected,
           "ahead walk named the wrong loads as only filling a flattened dword");
   }
+  Check(plan.descriptor_word_flat.size() == 16 && plan.descriptor_word_flat[8] == 1u,
+        "the refreshable descriptor word did not name the flattened dword it also fills");
+}
+
+void TestAheadWalkNamesDescriptorWordLoads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A buffer V# loaded from guest memory: its base (word 0) only reaches the host binding, its
+  // record count (word 2) also decides the specialization. Only the base load names its word.
+  auto program = SrtProgram(0x41000u);
+  auto &block = *program.blocks[0];
+  const auto append_load = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    return Value(&read);
+  };
+  const auto base = append_load(0x42000u);
+  const auto records = append_load(0x42008u);
+  program.descriptor_sources.push_back(
+      {.dwords = {base, Value(0u), records, Value(0u)}, .dword_count = 4});
+  program.info.buffers.push_back({.source = 1});
+  auto plan = Extract(program);
+  Check(plan.descriptor_refresh.size() == 2 &&
+            plan.descriptor_refresh[1] == DescriptorRefresh::Buffer,
+        "a direct buffer source was not marked refreshable");
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address == 0x41000u) words[0] = 0x1111u;
+        else if (address == 0x42000u) words[0] = 0x50000u;
+        else if (address == 0x42008u) words[0] = 16u;
+        else return false;
+        return true;
+      });
+  struct Load {
+    uint64_t address = 0;
+    uint32_t flat_slot = 0;
+  };
+  std::vector<Load> loads;
+  const SrtRuntime runtime{
+      .userdata = &loads,
+      .record_load = +[](void *data, uint64_t address, uint32_t, uint32_t flat_slot) {
+        static_cast<std::vector<Load> *>(data)->push_back({address, flat_slot});
+      }};
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(plan, runtime, flat, nullptr), "ahead walk of a V# failed");
+  bool base_named = false;
+  for (const auto &load : loads) {
+    if (load.address == 0x42000u) {
+      base_named = load.flat_slot == DescriptorSlot(1, 0);
+    } else if (load.address == 0x42008u) {
+      Check(load.flat_slot == NoFlatSlot, "ahead walk named a V# record count as refreshable");
+    }
+  }
+  Check(base_named, "ahead walk did not name the V# base load as a refreshable word");
+  Check(DescriptorRefreshMask(DescriptorRefresh::Image, 5) == 0x027fff00u &&
+            DescriptorRefreshMask(DescriptorRefresh::Image, 3) == 0u &&
+            DescriptorRefreshMask(DescriptorRefresh::Buffer, 1) == 0x0000ffffu,
+        "descriptor refresh masks changed");
 }
 
 void TestUniformVectorDescriptorRead() {
@@ -1579,6 +1641,7 @@ int main() {
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
   TestAheadWalkNamesFlatOnlyLoads();
+  TestAheadWalkNamesDescriptorWordLoads();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();

@@ -578,21 +578,45 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 
 // A load node whose value fills one flattened SRT dword and nothing else: no other node, no
 // control condition, descriptor word or output uses it, nor any EXEC mask a context tests.
+// Likewise a load whose value is one descriptor word with refreshable bits (see
+// ResourcePlan::descriptor_refresh), and at most one flattened SRT dword besides, reports that
+// word (and the plan records the flattened dword in descriptor_word_flat).
 void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
                                        std::span<const Operand> reads,
                                        std::span<const std::vector<Operand>> descriptors,
                                        std::span<const Operand> outputs) {
 	m_flat_slots.assign(m_nodes.size(), NoFlatSlot);
-	std::vector<bool> used(m_nodes.size(), false);
+	std::vector<bool>     used(m_nodes.size(), false);
+	std::vector<bool>     other_use(m_nodes.size(), false);
+	std::vector<uint32_t> word_uses(m_nodes.size(), 0);
+	std::vector<uint32_t> word_slot(m_nodes.size(), NoFlatSlot);
+	std::vector<uint32_t> flat_reads(m_nodes.size(), 0);
+	std::vector<uint32_t> flat_of(m_nodes.size(), NoFlatSlot);
+	m_plan.descriptor_word_flat.assign(descriptors.size() * 8u, NoFlatSlot);
 	const auto use = [&](const Operand& operand) {
-		if (operand.kind == Kind::Node && operand.value < used.size()) used[operand.value] = true;
+		if (operand.kind == Kind::Node && operand.value < used.size()) {
+			used[operand.value]      = true;
+			other_use[operand.value] = true;
+		}
 	};
 	for (const auto& node: m_nodes) {
 		for (const auto& arg: node.args) use(arg);
 	}
 	for (const auto& operand: conditions) use(operand);
-	for (const auto& words: descriptors) {
-		for (const auto& operand: words) use(operand);
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		const auto kind = source < m_plan.descriptor_refresh.size() ? m_plan.descriptor_refresh[source]
+		                                                            : DescriptorRefresh::None;
+		for (uint32_t word = 0; word < descriptors[source].size(); ++word) {
+			const auto& operand = descriptors[source][word];
+			if (operand.kind != Kind::Node || operand.value >= used.size()) continue;
+			used[operand.value] = true;
+			word_uses[operand.value]++;
+			if (DescriptorRefreshMask(kind, word) != 0) {
+				word_slot[operand.value] = DescriptorSlot(source, word);
+			} else {
+				other_use[operand.value] = true;
+			}
+		}
 	}
 	for (const auto& operand: outputs) use(operand);
 	std::unordered_set<const Inst*> masks;
@@ -603,16 +627,28 @@ void WalkerCompiler::FindFlatOnlyNodes(std::span<const Operand> conditions,
 		const auto& operand = reads[slot];
 		if (operand.kind != Kind::Node || operand.value >= m_nodes.size()) continue;
 		const auto index = static_cast<size_t>(operand.value);
+		flat_reads[index]++;
+		flat_of[index] = m_plan.srt_reads[slot].flat_offset;
 		if (m_flat_slots[index] != NoFlatSlot) used[index] = true; // Two dwords.
 		m_flat_slots[index] = m_plan.srt_reads[slot].flat_offset;
 	}
 	for (size_t index = 0; index < m_nodes.size(); ++index) {
 		const auto& node = m_nodes[index];
 		const auto  op   = node.inst->GetOpcode();
-		if (used[index] || node.referenced || masks.contains(node.inst) ||
-		    (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
-		     op != ValueOpcode::LoadBufferU32)) {
+		const bool  load = !node.referenced && !masks.contains(node.inst) &&
+		                  (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		                   op == ValueOpcode::LoadBufferU32);
+		if (used[index] || !load) {
 			m_flat_slots[index] = NoFlatSlot;
+		}
+		if (load && m_flat_slots[index] == NoFlatSlot && !other_use[index] &&
+		    word_uses[index] == 1 && word_slot[index] != NoFlatSlot && flat_reads[index] <= 1) {
+			m_flat_slots[index] = word_slot[index];
+			if (flat_reads[index] == 1) {
+				const auto word = DescriptorSlotSource(word_slot[index]) * 8u +
+				                  DescriptorSlotWord(word_slot[index]);
+				m_plan.descriptor_word_flat[word] = flat_of[index];
+			}
 		}
 	}
 }
@@ -1477,7 +1513,56 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 } // namespace
 
+// A source whose descriptor only becomes direct buffer (or image) bindings: no indirect
+// descriptor reads a table, candidate, selector, row count or mask through it and no sampler
+// uses it. Selector reads compare the ranges of written buffers with the selector table, so a
+// program with selectors keeps its V# bases.
+static void FindRefreshableSources(ResourcePlan& plan) {
+	const auto& sources = plan.descriptor_sources;
+	auto&       refresh = plan.descriptor_refresh;
+	refresh.assign(sources.size(), DescriptorRefresh::None);
+	std::vector<bool> excluded(sources.size(), false);
+	const auto exclude = [&](uint32_t source) {
+		if (source < excluded.size()) excluded[source] = true;
+	};
+	bool selectors = false;
+	for (const auto& source: sources) {
+		if (!source.indirect_descriptor) continue;
+		const auto& indirect = *source.indirect_descriptor;
+		exclude(indirect.table_source);
+		for (const auto candidate: indirect.sources) exclude(candidate);
+		if (indirect.selector) {
+			selectors = true;
+			exclude(indirect.selector->source);
+			if (indirect.selector->rows) exclude(indirect.selector->rows->source);
+			if (indirect.selector->ranks) exclude(indirect.selector->ranks->source);
+		}
+	}
+	for (const auto& sampler: plan.info.samplers) exclude(sampler.source);
+	const auto assign = [&](uint32_t source, DescriptorRefresh kind) {
+		if (source >= sources.size()) return;
+		if (sources[source].indirect_descriptor ||
+		    (refresh[source] != DescriptorRefresh::None && refresh[source] != kind)) {
+			exclude(source);
+			return;
+		}
+		refresh[source] = kind;
+	};
+	for (const auto& buffer: plan.info.buffers) {
+		if (selectors) {
+			exclude(buffer.source);
+		} else {
+			assign(buffer.source, DescriptorRefresh::Buffer);
+		}
+	}
+	for (const auto& image: plan.info.images) assign(image.source, DescriptorRefresh::Image);
+	for (uint32_t source = 0; source < sources.size(); ++source) {
+		if (excluded[source]) refresh[source] = DescriptorRefresh::None;
+	}
+}
+
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+	if (values.empty()) FindRefreshableSources(plan);
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
