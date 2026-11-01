@@ -187,11 +187,20 @@ static uint64_t KernelHostTscFrequency() {
 // hid it at low fps). Present a counter at that rate to the guest, whatever the host runs at.
 static constexpr uint64_t GUEST_TSC_FREQUENCY = 1594000000;
 
+// The guest counter is host_tsc * multiplier / 2^32. The loader rewrites the guest's own RDTSC
+// and RDTSCP to the same product (see PatchGuestInstructions()): code that reads the counter
+// itself and converts it with sceKernelGetTscFrequency() (Demon's Souls) must see that rate.
+uint64_t KernelGuestTscMultiplier() {
+	static const uint64_t multiplier = static_cast<uint64_t>(
+	    ((static_cast<unsigned __int128>(GUEST_TSC_FREQUENCY) << 32u) + KernelHostTscFrequency() / 2) /
+	    KernelHostTscFrequency());
+	return multiplier;
+}
+
 static uint64_t KernelReadTscNative() {
-	const auto host      = KernelHostTsc();
-	const auto frequency = KernelHostTscFrequency();
-	// Whole seconds and the remainder apart so that the product cannot overflow 64 bits.
-	return (host / frequency) * GUEST_TSC_FREQUENCY + (host % frequency) * GUEST_TSC_FREQUENCY / frequency;
+	const auto host = KernelHostTsc();
+	const auto product = static_cast<unsigned __int128>(host) * KernelGuestTscMultiplier();
+	return static_cast<uint64_t>(product >> 32u);
 }
 
 static uint64_t KernelGetTscFrequencyNative() {

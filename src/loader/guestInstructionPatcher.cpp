@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
+#include "kernel/pthread.h"
 
 #include <Zydis/Zydis.h>
 #include <algorithm>
@@ -132,7 +133,8 @@ enum class InstructionReplacement {
 	ExtractQ,
 	InsertQ,
 	ReadProcessorId,
-	CacheLineWriteBack
+	CacheLineWriteBack,
+	ReadTimeStampCounter
 };
 
 struct InstructionRewrite {
@@ -149,6 +151,7 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
 		case InstructionReplacement::ExtractQ: return result.extrq;
 		case InstructionReplacement::InsertQ: return result.insertq;
 		case InstructionReplacement::ReadProcessorId: return result.rdpid;
+		case InstructionReplacement::ReadTimeStampCounter: return result.rdtsc;
 		default: return result.clwb;
 	}
 }
@@ -1128,6 +1131,59 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
 	}
 }
 
+// RDTSC/RDTSCP at the guest rate: EDX:EAX = (host counter * multiplier) >> 32, the upper halves of
+// RAX and RDX cleared and ECX = TSC_AUX for RDTSCP, as the instruction leaves them. RFLAGS and the
+// other registers are preserved; spills go below the guest red zone.
+void GenerateReadTimeStampCounter(const DecodedCodeInstruction& decoded, u64 multiplier,
+                                  Xbyak::CodeGenerator& generator) {
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	generator.pushfq();
+	generator.push(r11);
+	if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+		generator.rdtscp();
+	} else {
+		generator.rdtsc();
+	}
+	generator.shl(rdx, 32);
+	generator.or_(rax, rdx);
+	generator.mov(r11, multiplier);
+	generator.mul(r11);
+	generator.shrd(rax, rdx, 32);
+	generator.mov(rdx, rax);
+	generator.shr(rdx, 32);
+	generator.mov(eax, eax);
+	generator.pop(r11);
+	generator.popfq();
+	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+
+void CollectTscInstructions(const DecodedFunction&                   function,
+                            std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                            GuestInstructionPatchResult&             result) {
+	for (const auto& [address, decoded]: function.instructions) {
+		const auto mnemonic = decoded.instruction.mnemonic;
+		if (mnemonic != ZYDIS_MNEMONIC_RDTSC && mnemonic != ZYDIS_MNEMONIC_RDTSCP) {
+			continue;
+		}
+		++result.rdtsc.found;
+		rewrite_sites[address].replacement = InstructionReplacement::ReadTimeStampCounter;
+	}
+}
+
+// Whether the bytes of [start, end) contain an RDTSC (0F 31) or RDTSCP (0F 01 F9) encoding: only
+// those functions are decoded when nothing else is patched.
+bool MayReadTimeStampCounter(uintptr_t start, uintptr_t end) {
+	const auto* code = reinterpret_cast<const u8*>(start);
+	const auto  size = end - start;
+	for (size_t i = 0; i + 1 < size; ++i) {
+		if (code[i] == 0x0f && (code[i + 1] == 0x31 ||
+		                        (code[i + 1] == 0x01 && i + 2 < size && code[i + 2] == 0xf9))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void MarkInstructionTrap(u8* code, const ZydisDecodedInstruction& instruction,
                          InstructionReplacement replacement) {
 	if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
@@ -1168,6 +1224,10 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 			continue;
 		}
 		const auto& decoded = function.instructions.at(address);
+		if (rewrite.replacement == InstructionReplacement::ReadTimeStampCounter) {
+			// RDTSC does not fault: an instruction no trampoline could take keeps the host rate.
+			continue;
+		}
 		if (NeedsTrapRedZoneProtection(decoded)) {
 			if (rewrite.replacement != InstructionReplacement::ReciprocalSquareRoot) {
 				// Leaving an unsupported instruction unchanged still traps with a live red zone.
@@ -1186,7 +1246,7 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 
 void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& function,
                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                               GuestInstructionPatchResult&                   result) {
+                               GuestInstructionPatchResult& result, u64 tsc_multiplier) {
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1232,6 +1292,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 						GenerateReciprocalSquareRoot(*decoded, generator);
 					} else if (replacement == InstructionReplacement::ExtractQ) {
 						GenerateExtractQ(*decoded, generator);
+					} else if (replacement == InstructionReplacement::ReadTimeStampCounter) {
+						GenerateReadTimeStampCounter(*decoded, tsc_multiplier, generator);
 					} else {
 						// CLFLUSH writes back dirty data too; invalidation is a permitted stronger
 						// action.
@@ -1667,7 +1729,8 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 			rdpid = (leaf[2] & (1u << 22)) != 0;
 		}
 		return GuestInstructionHostFeatures {cpu.has(Xbyak::util::Cpu::tSSE4a), rdpid,
-		                                     cpu.has(Xbyak::util::Cpu::tCLWB)};
+		                                     cpu.has(Xbyak::util::Cpu::tCLWB),
+		                                     Libs::LibKernel::KernelGuestTscMultiplier()};
 	}();
 	return features;
 }
@@ -1677,7 +1740,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
                                                    bool protect_memory, bool emulate_amd,
                                                    GuestInstructionHostFeatures host_features) {
 	GuestInstructionPatchResult result {};
-	if (!protect_memory && !emulate_amd) {
+	const bool scale_tsc = host_features.tsc_multiplier != 0;
+	if (!protect_memory && !emulate_amd && !scale_tsc) {
 		return result;
 	}
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
@@ -1710,6 +1774,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		if (function_end <= function_start) {
 			continue;
 		}
+		if (!protect_memory && !emulate_amd && !MayReadTimeStampCounter(function_start, function_end)) {
+			continue;
+		}
 
 		++result.function_count;
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
@@ -1731,8 +1798,12 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		if (emulate_amd) {
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
+		if (scale_tsc) {
+			CollectTscInstructions(function, rewrite_sites, result);
+		}
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result);
+			RelocateGuestInstructions(module, function, rewrite_sites, result,
+			                          host_features.tsc_multiplier);
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
 		}
 	}

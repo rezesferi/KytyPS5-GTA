@@ -15,6 +15,8 @@ struct GuestInstructionHostFeatures {
 	bool sse4a = false;
 	bool rdpid = false;
 	bool clwb  = false;
+	// Guest RDTSC/RDTSCP results are the host counter times this, divided by 2^32 (0: unchanged).
+	uint64_t tsc_multiplier = 0;
 };
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures();
@@ -50,13 +52,15 @@ struct GuestInstructionPatchResult {
 	InstructionPatchCounts insertq;
 	InstructionPatchCounts rdpid;
 	InstructionPatchCounts clwb;
+	InstructionPatchCounts rdtsc;
 };
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
-// Apply enabled instruction fixes using native trampolines or safe trap fallbacks.
+// Apply enabled instruction fixes using native trampolines or safe trap fallbacks. With a TSC
+// multiplier, the guest's RDTSC and RDTSCP also read the counter at the guest rate.
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
     bool protect_memory, bool emulate_amd,

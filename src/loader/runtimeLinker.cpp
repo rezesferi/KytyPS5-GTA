@@ -1767,7 +1767,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	// The guest's own RDTSC/RDTSCP read the counter at the rate sceKernelGetTscFrequency() reports.
+	const bool scale_guest_tsc          = true;
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd || scale_guest_tsc;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1896,6 +1898,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
 			                                           protect_memory_faults, emulate_amd);
+			totals.rdtsc += result.rdtsc;
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -1913,6 +1916,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (totals.rdtsc.found != 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest TSC: {} RDTSC/RDTSCP at the guest rate: native={}, skipped={}\n", module_name,
+			    totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};

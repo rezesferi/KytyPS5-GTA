@@ -200,6 +200,8 @@ int KYTY_SYSV_ABI      KernelConvertLocaltimeToUtc(int64_t local_time, int64_t r
 int KYTY_SYSV_ABI      KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_time,
                                                    KernelTimesec* st, uint64_t* dst_sec);
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency();
+// The guest time stamp counter is the host's times this, divided by 2^32.
+uint64_t KernelGuestTscMultiplier();
 uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();
