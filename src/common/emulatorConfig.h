@@ -84,7 +84,7 @@ struct ConfigOptions {
 	std::filesystem::path  dlss_folder;
 	uint32_t               dlss_preset                 = 0; // 0 is the model default
 	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = false;
+	bool                   guest_tsc_enabled           = true;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
 	uint32_t               vblank_frequency            = 60;
